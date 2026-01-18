@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Surf Runner - Waves, Wake, Obstacles</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body { height:100%; margin:0; background: linear-gradient(#87CEEB,#E0FFFF); font-family: Inter, system-ui, sans-serif; }
+    #game { width:100%; height:100%; position:relative; overflow:hidden; }
+    canvas { display:block; }
+    .hud { position:absolute; left:0; right:0; pointer-events:none; }
+    .score { position:absolute; top:16px; left:50%; transform:translateX(-50%); background:rgba(255,255,255,0.06); padding:8px 14px; border-radius:20px; color:#003; font-weight:600; pointer-events:auto; }
+    .meters { position:absolute; bottom:16px; left:50%; transform:translateX(-50%); display:flex; gap:12px; align-items:center; pointer-events:none; }
+    .meter { background:rgba(255,255,255,0.06); padding:6px 10px; border-radius:14px; color:#003; min-width:120px; text-align:center; }
+    .hint { position:absolute; bottom:16px; right:16px; background:rgba(255,255,255,0.04); padding:8px 10px; border-radius:10px; color:#003; font-size:13px; pointer-events:auto; }
+    .overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:auto; }
+    .menu { background:linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,255,255,0.95)); padding:26px; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.18); text-align:center; width:360px; }
+    .btn { background:#00A3FF; color:white; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:700; border:none; }
+    .gameover { background:rgba(0,0,0,0.7); color:white; padding:18px; border-radius:12px; text-align:center; }
+    #hitFlash { position:absolute; inset:0; background:rgba(255,80,80,0.12); pointer-events:none; opacity:0; transition:opacity 0.18s ease-out; }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="hitFlash"></div>
+
+  <div class="hud">
+    <div class="score" id="score">Score: 0</div>
+    <div class="meters">
+      <div class="meter" id="distance">Distance: 0m</div>
+      <div class="meter" id="shark">Shark Threat: 0%</div>
+      <div class="meter" id="hits">Hits: 0</div>
+    </div>
+    <div class="hint" id="hint">Controls: W/A/S/D • Space jump • Q crouch</div>
+  </div>
+
+  <div id="startOverlay" class="overlay">
+    <div class="menu">
+      <h1>Surf Runner Prototype</h1>
+      <p style="margin:6px 0 14px;color:#045;font-size:13px;">Waves, wake, big unjumpable boat, trash spheres, background props</p>
+      <button id="startBtn" class="btn">Start Surfing</button>
+      <p style="margin-top:12px;font-size:13px;color:#034;">PC controls: W A S D • Space • Q</p>
+    </div>
+  </div>
+
+  <div id="gameOverOverlay" class="overlay" style="display:none; pointer-events:auto;">
+    <div class="gameover">
+      <h2 id="goTitle">Game Over</h2>
+      <p id="goScore" style="margin:6px 0 0;">You were caught by the shark</p>
+      <button id="retryBtn" class="btn" style="margin-top:12px;">Retry</button>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.min.js"></script>
+  <script>
+  // Surf Runner - Waves + Wake + new obstacles + background props
+  let scene, camera, renderer, clock;
+  let player, playerController, cameraController;
+  let shark, sharkController;
+  let obstacleSpawner, laneRopes, backgroundGroup;
+  const lanes = [-2.6, 0, 2.6];
+  const baseSpeed = 14;
+  let running = false;
+  let gameOver = false;
+
+  // hit & shark config
+  const MAX_HITS_BEFORE_LOSE = 2;
+  const HIT_SLOW_DURATION = 900;
+  const HIT_SPEED_PENALTY = 0.6;
+  const STABLE_DURATION = 10.0;
+
+  // wave parameters
+  let waterMesh, waterOriginalVerts = [];
+  const WAVE_AMPLITUDE = 0.12;
+  const WAVE_SPEED = 0.9;
+  const WAVE_FREQ = 0.6;
+
+  // surf wake
+  let wakeSprite;
+
+  init();
+
+  function init() {
+    const container = document.getElementById('game');
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0xBFEFFF, 0.0025);
+
+    camera = new THREE.PerspectiveCamera(62, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 4.2, 10);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x87CEEB);
+    container.appendChild(renderer.domElement);
+
+    clock = new THREE.Clock();
+
+    window.addEventListener('resize', onWindowResize);
+
+    initLights();
+    initWater();           // creates waterMesh and stores original vertices
+    initPlayer();
+    initWake();
+    initShark();
+    initLaneRopes();
+    initBackgroundProps();
+    initSpawner();
+    initInput();
+
+    document.getElementById('startBtn').addEventListener('click', () => {
+      document.getElementById('startOverlay').style.display = 'none';
+      running = true;
+      clock.getDelta();
+      animate();
+    });
+
+    document.getElementById('retryBtn').addEventListener('click', () => location.reload());
+  }
+
+  function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }
+
+  function initLights() {
+    const hemi = new THREE.HemisphereLight(0xffffee, 0x444466, 0.95);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(-6, 12, -6);
+    scene.add(dir);
+  }
+
+  function initWater() {
+    // higher-res plane for nicer vertex waves but still light
+    const geo = new THREE.PlaneGeometry(3000, 3000, 120, 120);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x1E90FF, roughness: 0.6, metalness: 0.05, transparent:true, opacity:0.96, side: THREE.DoubleSide });
+    waterMesh = new THREE.Mesh(geo, mat);
+    waterMesh.rotation.x = -Math.PI / 2;
+    waterMesh.position.y = 0;
+    scene.add(waterMesh);
+
+    // store original vertices for displacement
+    const pos = waterMesh.geometry.attributes.position;
+    for (let i=0;i<pos.count;i++) {
+      waterOriginalVerts.push(pos.getY(i));
+    }
+  }
+
+  function initPlayer() {
+    player = new THREE.Group();
+    player.position.set(0, 0.22, 0);
+
+    const board = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.06, 0.5), new THREE.MeshStandardMaterial({ color: 0xFF6F3C }));
+    board.position.y = 0;
+    player.add(board);
+
+    const rider = new THREE.Mesh(new THREE.CapsuleGeometry(0.18, 0.6, 4, 8), new THREE.MeshStandardMaterial({ color: 0x2E8B57 }));
+    rider.position.set(0, 0.5, 0);
+    player.add(rider);
+
+    scene.add(player);
+
+    playerController = {
+      laneIndex: 1,
+      targetX: lanes[1],
+      speed: baseSpeed,
+      verticalState: 'ground',
+      jumpStart: 0,
+      jumpDur: 0.58,
+      jumpHeight: 1.25,
+      skimStart: 0,
+      skimDur: 0.36,
+      score: 0,
+      distance: 0,
+      width: 1.8,
+      depth: 0.6,
+      hits: 0,
+      isSlowed: false,
+      slowTimeout: null,
+      stableTimer: 0
+    };
+
+    cameraController = new CameraController(camera, player);
+  }
+
+  function initWake() {
+    // simple circular sprite under board to simulate foam/wake
+    const canvas = document.createElement('canvas');
+    canvas.width = 128; canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    const g = ctx.createRadialGradient(64,64,8,64,64,64);
+    g.addColorStop(0,'rgba(255,255,255,0.95)');
+    g.addColorStop(0.6,'rgba(255,255,255,0.35)');
+    g.addColorStop(1,'rgba(255,255,255,0.0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,128,128);
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent:true, opacity:0.9, depthWrite:false });
+    wakeSprite = new THREE.Sprite(mat);
+    wakeSprite.scale.set(1.6, 1.6, 1.6);
+    wakeSprite.position.set(0, 0.05, 0.2);
+    player.add(wakeSprite);
+  }
+
+  function initShark() {
+    shark = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.ConeGeometry(0.9, 2.2, 12), new THREE.MeshStandardMaterial({ color: 0x6B6F75 }));
+    body.rotation.x = Math.PI / 2;
+    body.position.set(0, 0.4, 0);
+    shark.add(body);
+    const fin = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.6, 6), new THREE.MeshStandardMaterial({ color: 0x55585F }));
+    fin.rotation.x = Math.PI;
+    fin.position.set(0, 0.9, -0.2);
+    shark.add(fin);
+
+    shark.position.set(0, 0.2, 14);
+    scene.add(shark);
+
+    sharkController = {
+      threat: 0,
+      inView: false,
+      inViewZOffset: 6.5,
+      retreatZOffset: 12,
+      stableRequired: STABLE_DURATION,
+      update: function(dt) {
+        this.threat = Math.max(0, this.threat - dt * 2.2);
+        if (this.inView) {
+          const desiredZ = player.position.z + this.inViewZOffset;
+          shark.position.z = THREE.MathUtils.lerp(shark.position.z, desiredZ, 0.12);
+          shark.position.x = THREE.MathUtils.lerp(shark.position.x, player.position.x, 0.12);
+          shark.position.y = (this.threat > 65) ? Math.sin(performance.now() * 0.01) * 0.35 + 0.25 : 0.2;
+        } else {
+          const desiredZ = player.position.z + this.retreatZOffset - (this.threat / 100) * 6;
+          shark.position.z = THREE.MathUtils.lerp(shark.position.z, desiredZ, 0.12);
+          shark.position.x = THREE.MathUtils.lerp(shark.position.x, player.position.x, 0.06);
+          shark.position.y = (this.threat > 65) ? Math.sin(performance.now() * 0.01) * 0.35 + 0.25 : 0.2;
+        }
+      },
+      forceInView: function() {
+        this.inView = true;
+        this.threat = Math.max(this.threat, 40);
+        playerController.stableTimer = 0;
+      },
+      tryRetreat: function() {
+        this.inView = false;
+      }
+    };
+  }
+
+  function initLaneRopes() {
+    laneRopes = new THREE.Group();
+    const ropeMat = new THREE.MeshStandardMaterial({ color: 0xF2E6C8, metalness:0.1, roughness:0.8 });
+    const leftX = lanes[0] - 1.0;
+    const rightX = lanes[2] + 1.0;
+    const ropeGeo = new THREE.CylinderGeometry(0.03, 0.03, 2000, 6);
+    const leftRope = new THREE.Mesh(ropeGeo, ropeMat);
+    leftRope.rotation.x = Math.PI / 2;
+    leftRope.position.set(leftX, 0.15, 0);
+    laneRopes.add(leftRope);
+    const rightRope = new THREE.Mesh(ropeGeo, ropeMat);
+    rightRope.rotation.x = Math.PI / 2;
+    rightRope.position.set(rightX, 0.15, 0);
+    laneRopes.add(rightRope);
+    const postGeo = new THREE.CylinderGeometry(0.06, 0.06, 0.6, 6);
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x8B5A2B });
+    for (let i=-6;i<=6;i++) {
+      const p1 = new THREE.Mesh(postGeo, postMat);
+      p1.position.set(leftX, 0.3, i * 12);
+      laneRopes.add(p1);
+      const p2 = new THREE.Mesh(postGeo, postMat);
+      p2.position.set(rightX, 0.3, i * 12);
+      laneRopes.add(p2);
+    }
+    scene.add(laneRopes);
+  }
+
+  function initBackgroundProps() {
+    backgroundGroup = new THREE.Group();
+    // distant island (simple low poly mound)
+    const islandGeo = new THREE.ConeGeometry(6, 2.6, 8);
+    const islandMat = new THREE.MeshStandardMaterial({ color: 0x2E8B57 });
+    const island = new THREE.Mesh(islandGeo, islandMat);
+    island.rotation.x = Math.PI;
+    island.position.set(-18, -0.2, -180);
+    island.scale.set(1.6,1,1.6);
+    backgroundGroup.add(island);
+    // palm silhouette (thin boxes)
+    for (let i=0;i<3;i++) {
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,2.6,6), new THREE.MeshStandardMaterial({ color:0x8B5A2B }));
+      trunk.position.set(-18 + i*6, 1.0, -176 + i*4);
+      backgroundGroup.add(trunk);
+      const leaf = new THREE.Mesh(new THREE.BoxGeometry(3.6,0.06,0.6), new THREE.MeshStandardMaterial({ color:0x2E8B57 }));
+      leaf.position.set(-18 + i*6, 2.0, -176 + i*4);
+      leaf.rotation.z = (i%2===0)?0.6:-0.6;
+      backgroundGroup.add(leaf);
+    }
+    // distant slow boats (outside ropes)
+    for (let i=0;i<4;i++) {
+      const b = new THREE.Mesh(new THREE.BoxGeometry(3.2,0.6,1.2), new THREE.MeshStandardMaterial({ color:0xC0502E }));
+      b.position.set(12 + i*8, 0.3, -120 - i*40);
+      b.userData.bgBoat = true;
+      backgroundGroup.add(b);
+    }
+    scene.add(backgroundGroup);
+  }
+
+  function initSpawner() {
+    obstacleSpawner = {
+      pool: [],
+      active: [],
+      spawnTimer: 0,
+      spawnInterval: 0.95,
+      initPool: function() {
+        // small boats
+        for (let i=0;i<12;i++) {
+          const g = new THREE.Group();
+          const mesh = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.6, 2.0), new THREE.MeshStandardMaterial({ color: 0x8B4513 }));
+          mesh.position.y = 0.3;
+          g.add(mesh);
+          g.userData.type = 'boat';
+          g.visible = false;
+          scene.add(g);
+          this.pool.push(g);
+        }
+        // big unjumpable boats (wider visually but still placed in single lane)
+        for (let i=0;i<6;i++) {
+          const g = new THREE.Group();
+          const mesh = new THREE.Mesh(new THREE.BoxGeometry(2.0, 0.9, 3.2), new THREE.MeshStandardMaterial({ color: 0x6A3E2A }));
+          mesh.position.y = 0.45;
+          g.add(mesh);
+          g.userData.type = 'bigBoat';
+          g.visible = false;
+          scene.add(g);
+          this.pool.push(g);
+        }
+        // trash spheres (plastic waste)
+        for (let i=0;i<10;i++) {
+          const g = new THREE.Group();
+          const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.45, 10, 8), new THREE.MeshStandardMaterial({ color: 0x8A8A8A }));
+          mesh.position.y = 0.25;
+          g.add(mesh);
+          g.userData.type = 'trash';
+          g.visible = false;
+          scene.add(g);
+          this.pool.push(g);
+        }
+      },
+      spawn: function() {
+        // spawn probabilities: small boat 55%, bigBoat 20%, trash 25%
+        const r = Math.random();
+        let desiredType = 'boat';
+        if (r < 0.55) desiredType = 'boat';
+        else if (r < 0.75) desiredType = 'bigBoat';
+        else desiredType = 'trash';
+        // find pool item of that type
+        let obj = null;
+        for (let i=0;i<this.pool.length;i++) {
+          if (!this.pool[i].visible && this.pool[i].userData.type === desiredType) { obj = this.pool[i]; break; }
+        }
+        if (!obj) {
+          // fallback: any free object
+          for (let i=0;i<this.pool.length;i++) if (!this.pool[i].visible) { obj = this.pool[i]; break; }
+        }
+        if (!obj) return;
+        obj.visible = true;
+        obj.userData.hit = false;
+        const laneIndex = Math.floor(Math.random()*3);
+        const laneX = lanes[laneIndex];
+        // place ahead (negative z)
+        obj.position.set(laneX + (Math.random()-0.5)*0.25, 0, player.position.z - 58 - Math.random()*36);
+        // small lateral drift for boats
+        obj.userData.crossDir = (Math.random()>0.5)?1:-1;
+        this.active.push(obj);
+      },
+      update: function(dt) {
+        this.spawnTimer += dt;
+        if (this.spawnTimer > this.spawnInterval) {
+          this.spawnTimer = 0;
+          this.spawn();
+          this.spawnInterval = Math.max(0.55, this.spawnInterval - 0.004);
+        }
+        for (let i=this.active.length-1;i>=0;i--) {
+          const o = this.active[i];
+          if (!o.visible) { this.active.splice(i,1); continue; }
+          if (o.userData.type === 'boat' || o.userData.type === 'bigBoat') {
+            o.position.z = THREE.MathUtils.lerp(o.position.z, player.position.z + 6, dt * 0.6);
+            o.position.x += o.userData.crossDir * dt * 0.35;
+            if (o.position.z > player.position.z + 10) { o.visible=false; this.active.splice(i,1); }
+          } else if (o.userData.type === 'trash') {
+            // trash floats and drifts slowly
+            o.position.z = THREE.MathUtils.lerp(o.position.z, player.position.z + 6, dt * 0.45);
+            o.position.x += Math.sin(performance.now()*0.0005 + i) * dt * 0.12;
+            if (o.position.z > player.position.z + 10) { o.visible=false; this.active.splice(i,1); }
+          } else {
+            if (o.position.z > player.position.z + 12) { o.visible=false; this.active.splice(i,1); }
+          }
+        }
+      }
+    };
+    obstacleSpawner.initPool();
+  }
+
+  function initInput() {
+    window.addEventListener('keydown', (e) => {
+      if (!running || gameOver) return;
+      const k = e.key.toLowerCase();
+      if (k === 'a' || e.key === 'arrowleft') requestLaneChange(-1);
+      if (k === 'd' || e.key === 'arrowright') requestLaneChange(1);
+      if (k === ' ') requestJump();
+      if (k === 'q') requestSkim();
+      if (k === 'w') playerController.speed = baseSpeed * 1.18;
+      if (k === 's') playerController.speed = baseSpeed * 0.9;
+    });
+    window.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'w' || k === 's') playerController.speed = baseSpeed;
+    });
+
+    renderer.domElement.addEventListener('click', (ev) => {
+      if (!running || gameOver) return;
+      const x = ev.clientX;
+      if (x < window.innerWidth * 0.33) requestLaneChange(-1);
+      else if (x > window.innerWidth * 0.66) requestLaneChange(1);
+      else requestJump();
+    });
+  }
+
+  function requestLaneChange(dir) {
+    const newIndex = THREE.MathUtils.clamp(playerController.laneIndex + dir, 0, lanes.length-1);
+    if (newIndex !== playerController.laneIndex) {
+      playerController.laneIndex = newIndex;
+      playerController.targetX = lanes[newIndex];
+      player.userData.tiltTarget = (dir * -0.22);
+    }
+  }
+
+  function requestJump() {
+    if (playerController.verticalState === 'ground') {
+      playerController.verticalState = 'jump';
+      playerController.jumpStart = clock.getElapsedTime();
+      player.userData.tiltTarget = 0;
+      // hide wake while airborne
+      wakeSprite.material.opacity = 0.0;
+    }
+  }
+
+  function requestSkim() {
+    if (playerController.verticalState === 'ground') {
+      playerController.verticalState = 'skim';
+      playerController.skimStart = clock.getElapsedTime();
+      playerController.speed = baseSpeed * 1.22;
+      setTimeout(()=>{ if (playerController.verticalState==='skim') playerController.speed = baseSpeed; }, playerController.skimDur*1000);
+    }
+  }
+
+  function CameraController(cam, target) {
+    this.cam = cam;
+    this.target = target;
+    this.bob = 0;
+    this.update = (dt) => {
+      const desired = new THREE.Vector3(
+        THREE.MathUtils.lerp(this.cam.position.x, target.position.x, 0.08),
+        THREE.MathUtils.lerp(this.cam.position.y, 4.2, 0.06),
+        target.position.z + 10
+      );
+      this.bob += dt * 2.0;
+      desired.y += Math.sin(this.bob) * 0.08;
+      this.cam.position.lerp(desired, 0.12);
+      const lookAt = new THREE.Vector3(target.position.x, target.position.y + 0.8, target.position.z - 4);
+      this.cam.lookAt(lookAt);
+
+      // keep lane ropes centered on player
+      laneRopes.children.forEach(child => {
+        child.position.z = player.position.z;
+      });
+
+      // background props drift slowly (visual only)
+      backgroundGroup.children.forEach((c, idx) => {
+        if (c.userData.bgBoat) {
+          c.position.x += Math.sin(performance.now()*0.0002 + idx) * 0.002;
+          c.position.z += 0.02; // slow forward drift to simulate distant movement
+        }
+      });
+    };
+  }
+
+  function aabbIntersect(aPos, aSize, bPos, bSize) {
+    return Math.abs(aPos.x - bPos.x) * 2 < (aSize.x + bSize.x) &&
+           Math.abs(aPos.y - bPos.y) * 2 < (aSize.y + bSize.y) &&
+           Math.abs(aPos.z - bPos.z) * 2 < (aSize.z + bSize.z);
+  }
+
+  function animate() {
+    if (!running) return;
+    if (gameOver) return;
+    requestAnimationFrame(animate);
+    const dt = Math.min(0.05, clock.getDelta());
+    updateWaves(dt);
+    updatePlayer(dt);
+    obstacleSpawner.update(dt);
+    sharkController.update(dt);
+    cameraController.update(dt);
+    checkCollisions();
+    renderer.render(scene, camera);
+    updateHUD();
+  }
+
+  function updateWaves(dt) {
+    // simple vertex displacement using sine waves
+    const pos = waterMesh.geometry.attributes.position;
+    const time = performance.now() * 0.001 * WAVE_SPEED;
+    for (let i=0;i<pos.count;i++) {
+      const x = pos.getX(i);
+      const y0 = waterOriginalVerts[i];
+      // combine two sine waves for variety
+      const wave = Math.sin((x * WAVE_FREQ) + time) * WAVE_AMPLITUDE + Math.cos((pos.getZ(i) * WAVE_FREQ * 0.7) + time*0.8) * (WAVE_AMPLITUDE*0.6);
+      pos.setY(i, y0 + wave);
+    }
+    pos.needsUpdate = true;
+    waterMesh.geometry.computeVertexNormals();
+  }
+
+  function updatePlayer(dt) {
+    const dz = playerController.speed * dt;
+    player.position.z -= dz;
+    playerController.distance += Math.abs(dz);
+
+    player.position.x = THREE.MathUtils.lerp(player.position.x, playerController.targetX, 0.18);
+
+    if (!player.userData.tilt) player.userData.tilt = 0;
+    if (!player.userData.tiltTarget) player.userData.tiltTarget = 0;
+    player.userData.tilt = THREE.MathUtils.lerp(player.userData.tilt, player.userData.tiltTarget, 0.12);
+    player.rotation.z = player.userData.tilt;
+
+    const t = clock.getElapsedTime();
+    if (playerController.verticalState === 'jump') {
+      const elapsed = t - playerController.jumpStart;
+      const p = Math.min(1, elapsed / playerController.jumpDur);
+      const height = Math.sin(p * Math.PI) * playerController.jumpHeight;
+      player.position.y = 0.22 + height;
+      if (p >= 1) { playerController.verticalState = 'ground'; player.position.y = 0.22; wakeSprite.material.opacity = 0.9; }
+    } else if (playerController.verticalState === 'skim') {
+      const elapsed = t - playerController.skimStart;
+      const p = Math.min(1, elapsed / playerController.skimDur);
+      player.position.y = 0.06;
+      if (p >= 1) { playerController.verticalState = 'ground'; player.position.y = 0.22; playerController.speed = baseSpeed; wakeSprite.material.opacity = 0.9; }
+    } else {
+      player.position.y = THREE.MathUtils.lerp(player.position.y, 0.22, 0.2);
+      // wake visible while grounded and moving
+      wakeSprite.material.opacity = playerController.isSlowed ? 0.5 : 0.9;
+      // animate wake scale slightly with speed
+      const s = THREE.MathUtils.lerp(wakeSprite.scale.x, 1.2 + (playerController.speed - baseSpeed) * 0.02, 0.08);
+      wakeSprite.scale.set(s, s, s);
+    }
+
+    // stable timer logic
+    if (!playerController.isSlowed && playerController.hits > 0) {
+      playerController.stableTimer += dt;
+      if (playerController.stableTimer >= STABLE_DURATION && sharkController.inView) {
+        sharkController.tryRetreat();
+        playerController.stableTimer = 0;
+      }
+    } else {
+      playerController.stableTimer = 0;
+    }
+
+    playerController.score += Math.abs(dz) * 0.45;
+  }
+
+  function checkCollisions() {
+    for (let i=0;i<obstacleSpawner.active.length;i++) {
+      const o = obstacleSpawner.active[i];
+      if (!o.visible || o.userData.hit) continue;
+      const playerBox = { x: playerController.width, y: 1.2, z: playerController.depth };
+      // obstacle box sizes tuned per type
+      let oBox;
+      if (o.userData.type === 'boat') oBox = { x:1.2, y:0.9, z:2.0 };
+      else if (o.userData.type === 'bigBoat') oBox = { x:2.0, y:1.2, z:3.2 };
+      else oBox = { x:0.9, y:0.9, z:0.9 }; // trash sphere
+      const pPos = player.position;
+      const oPos = o.position;
+      if (aabbIntersect(pPos, playerBox, oPos, oBox)) {
+        // bigBoat is unjumpable: always counts as hit even if jumping
+        if (o.userData.type === 'bigBoat') {
+          o.userData.hit = true;
+          handleImpact(o);
+        } else {
+          // normal behavior: if jumping and obstacle is jumpable (trash or small boat), avoid collision
+          if (playerController.verticalState === 'jump' && o.userData.type !== 'bigBoat') {
+            // allow jump to pass over small boats and trash
+            // small boats are low enough to be jumped; do nothing
+          } else {
+            o.userData.hit = true;
+            handleImpact(o);
+          }
+        }
+      }
+    }
+
+    const dz = shark.position.z - player.position.z;
+    if (dz < 1.2) triggerGameOver();
+  }
+
+  function handleImpact(obstacle) {
+    if (playerController.isSlowed) {
+      playerController.hits++;
+    } else {
+      playerController.hits++;
+      applySlowEffect();
+    }
+
+    // force shark into view and increase threat
+    sharkController.forceInView();
+    sharkController.threat = Math.min(100, sharkController.threat + 22);
+
+    // knockback
+    player.position.z += 1.2;
+
+    flashHit();
+    document.getElementById('hits').innerText = `Hits: ${playerController.hits}`;
+
+    if (playerController.hits >= MAX_HITS_BEFORE_LOSE) {
+      sharkController.threat = 100;
+      setTimeout(() => {
+        shark.position.z = player.position.z + 0.9;
+        triggerGameOver();
+      }, 700);
+    }
+  }
+
+  function applySlowEffect() {
+    playerController.isSlowed = true;
+    playerController.speed = Math.max(6, playerController.speed * HIT_SPEED_PENALTY);
+    if (playerController.slowTimeout) clearTimeout(playerController.slowTimeout);
+    playerController.slowTimeout = setTimeout(() => {
+      playerController.speed = baseSpeed;
+      playerController.isSlowed = false;
+      playerController.slowTimeout = null;
+    }, HIT_SLOW_DURATION);
+  }
+
+  function flashHit() {
+    const f = document.getElementById('hitFlash');
+    f.style.opacity = '1';
+    setTimeout(()=>{ f.style.opacity = '0'; }, 160);
+  }
+
+  function triggerGameOver() {
+    if (gameOver) return;
+    gameOver = true;
+    running = false;
+    document.getElementById('gameOverOverlay').style.display = 'flex';
+    document.getElementById('goScore').innerText = `Score: ${Math.floor(playerController.score)} • Distance: ${Math.floor(playerController.distance)}m • Hits: ${playerController.hits}`;
+  }
+
+  function updateHUD() {
+    document.getElementById('score').innerText = `Score: ${Math.floor(playerController.score)}`;
+    document.getElementById('distance').innerText = `Distance: ${Math.floor(playerController.distance)}m`;
+    document.getElementById('shark').innerText = `Shark Threat: ${Math.min(100, Math.floor(sharkController.threat))}%`;
+    document.getElementById('hits').innerText = `Hits: ${playerController.hits}`;
+  }
+  </script>
+</body>
+</html>
